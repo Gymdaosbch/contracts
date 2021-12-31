@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 pragma solidity 0.7.5;
-pragma abicoder v2;
 
 interface IOwnable {
   function policy() external view returns (address);
@@ -12,61 +11,43 @@ interface IOwnable {
   function pullManagement() external;
 }
 
-contract OwnableData {
-    address public owner;
-    address public pendingOwner;
-}
+contract Ownable is IOwnable {
 
-contract Ownable is OwnableData {
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    address internal _owner;
+    address internal _newOwner;
 
-    /// @notice `owner` defaults to msg.sender on construction.
-    constructor() {
-        owner = msg.sender;
-        emit OwnershipTransferred(address(0), msg.sender);
+    event OwnershipPushed(address indexed previousOwner, address indexed newOwner);
+    event OwnershipPulled(address indexed previousOwner, address indexed newOwner);
+
+    constructor () {
+        _owner = msg.sender;
+        emit OwnershipPushed( address(0), _owner );
     }
 
-    /// @notice Transfers ownership to `newOwner`. Either directly or claimable by the new pending owner.
-    /// Can only be invoked by the current `owner`.
-    /// @param newOwner Address of the new owner.
-    /// @param direct True if `newOwner` should be set immediately. False if `newOwner` needs to use `claimOwnership`.
-    /// @param renounce Allows the `newOwner` to be `address(0)` if `direct` and `renounce` is True. Has no effect otherwise.
-    function transferOwnership(
-        address newOwner,
-        bool direct,
-        bool renounce
-    ) public onlyOwner {
-        if (direct) {
-            // Checks
-            require(newOwner != address(0) || renounce, "Ownable: zero address");
-
-            // Effects
-            emit OwnershipTransferred(owner, newOwner);
-            owner = newOwner;
-            pendingOwner = address(0);
-        } else {
-            // Effects
-            pendingOwner = newOwner;
-        }
+    function policy() public view override returns (address) {
+        return _owner;
     }
 
-    /// @notice Needs to be called by `pendingOwner` to claim ownership.
-    function claimOwnership() public {
-        address _pendingOwner = pendingOwner;
-
-        // Checks
-        require(msg.sender == _pendingOwner, "Ownable: caller != pending owner");
-
-        // Effects
-        emit OwnershipTransferred(owner, _pendingOwner);
-        owner = _pendingOwner;
-        pendingOwner = address(0);
-    }
-
-    /// @notice Only allows the `owner` to execute the function.
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Ownable: caller is not the owner");
+    modifier onlyPolicy() {
+        require( _owner == msg.sender, "Ownable: caller is not the owner" );
         _;
+    }
+
+    function renounceManagement() public virtual override onlyPolicy() {
+        emit OwnershipPushed( _owner, address(0) );
+        _owner = address(0);
+    }
+
+    function pushManagement( address newOwner_ ) public virtual override onlyPolicy() {
+        require( newOwner_ != address(0), "Ownable: new owner is the zero address");
+        emit OwnershipPushed( _owner, newOwner_ );
+        _newOwner = newOwner_;
+    }
+    
+    function pullManagement() public virtual override {
+        require( msg.sender == _newOwner, "Ownable: must be new owner to pull");
+        emit OwnershipPulled( _owner, _newOwner );
+        _owner = _newOwner;
     }
 }
 
@@ -265,6 +246,7 @@ library Address {
 
     }
 }
+
 interface IERC20 {
     function decimals() external view returns (uint8);
 
@@ -409,14 +391,41 @@ library FixedPoint {
     }
 }
 
+interface AggregatorV3Interface {
+
+  function decimals() external view returns (uint8);
+  function description() external view returns (string memory);
+  function version() external view returns (uint256);
+
+  // getRoundData and latestRoundData should both raise "No data present"
+  // if they do not have data to report, instead of returning unset values
+  // which could be misinterpreted as actual reported values.
+  function getRoundData(uint80 _roundId)
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+  function latestRoundData()
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+}
+
 interface ITreasury {
     function deposit( uint _amount, address _token, uint _profit ) external returns ( bool );
     function valueOf( address _token, uint _amount ) external view returns ( uint value_ );
-}
-
-interface IBondCalculator {
-    function valuation( address _LP, uint _amount ) external view returns ( uint );
-    function markdown( address _LP ) external view returns ( uint );
+    function mintRewards( address _recipient, uint _amount ) external;
 }
 
 interface IStaking {
@@ -427,10 +436,16 @@ interface IStakingHelper {
     function stake( uint _amount, address _recipient ) external;
 }
 
-contract GymBondDepository is Ownable {
+interface IWBCH is IERC20 {
+    /// @notice Deposit ether to get wrapped ether
+    function deposit() external payable;
+}
+
+contract BarbellBondDepository is Ownable {
 
     using FixedPoint for *;
     using SafeERC20 for IERC20;
+    using SafeERC20 for IWBCH;
     using LowGasSafeMath for uint;
     using LowGasSafeMath for uint32;
 
@@ -443,23 +458,17 @@ contract GymBondDepository is Ownable {
     event BondRedeemed( address indexed recipient, uint payout, uint remaining );
     event BondPriceChanged( uint indexed priceInUSD, uint indexed internalPrice, uint indexed debtRatio );
     event ControlVariableAdjustment( uint initialBCV, uint newBCV, uint adjustment, bool addition );
-    event InitTerms( Terms terms);
-    event LogSetTerms(PARAMETER param, uint value);
-    event LogSetAdjustment( Adjust adjust);
-    event LogSetStaking( address indexed stakingContract, bool isHelper);
-    event LogRecoverLostToken( address indexed tokenToRecover, uint amount);
+
 
 
 
     /* ======== STATE VARIABLES ======== */
-
-    IERC20 public immutable Gym; // token given as payment for bond
-    IERC20 public immutable principle; // token used to create bond
-    ITreasury public immutable treasury; // mints Gym when receives principle
+    IERC20 public immutable BRB; // token given as payment for bond
+    IWBCH public immutable principle; // token used to create bond
+    ITreasury public immutable treasury; // mints BRB when receives principle
     address public immutable DAO; // receives profit share from bond
 
-    bool public immutable isLiquidityBond; // LP and Reserve bonds are treated slightly different
-    IBondCalculator public immutable bondCalculator; // calculates value of LP tokens
+    AggregatorV3Interface public priceFeed;
 
     IStaking public staking; // to auto-stake payout
     IStakingHelper public stakingHelper; // to stake and claim if no staking warmup
@@ -471,11 +480,10 @@ contract GymBondDepository is Ownable {
     mapping( address => Bond ) public bondInfo; // stores bond information for depositors
 
     uint public totalDebt; // total value of outstanding bonds; used for pricing
-    uint32 public lastDecay; // reference gym for debt decay
+    uint32 public lastDecay; // reference BRB for debt decay
+
 
     mapping (address => bool) public allowedZappers;
-
-
 
 
     /* ======== STRUCTS ======== */
@@ -483,19 +491,18 @@ contract GymBondDepository is Ownable {
     // Info for creating new bonds
     struct Terms {
         uint controlVariable; // scaling variable for price
-        uint minimumPrice; // vs principle value
+        uint minimumPrice; // vs principle value. 4 decimals (1500 = 0.15)
         uint maxPayout; // in thousandths of a %. i.e. 500 = 0.5%
-        uint fee; // as % of bond payout, in hundreths. ( 500 = 5% = 0.05 for every 1 paid)
         uint maxDebt; // 9 decimal debt ratio, max % total supply created as debt
         uint32 vestingTerm; // in seconds
     }
 
     // Info for bond holder
     struct Bond {
-        uint payout; // Gym remaining to be paid
-        uint pricePaid; // In FLEXUSD, for front end viewing
-        uint32 lastTime; // Last interaction
+        uint payout; // BRB remaining to be paid
+        uint pricePaid; // In DAI, for front end viewing
         uint32 vesting; // Seconds left to vest
+        uint32 lastTime; // Last interaction
     }
 
     // Info for incremental adjustments to control variable 
@@ -513,57 +520,51 @@ contract GymBondDepository is Ownable {
     /* ======== INITIALIZATION ======== */
 
     constructor ( 
-        address Barbell,
+        address _BRB,
         address _principle,
         address _treasury, 
-        address _DAO, 
-        address _bondCalculator
+        address _DAO,
+        address _feed
     ) {
-        require( _Barbell != address(0) );
-        Barbell = IERC20(_Barbell);
+        require( _BRB != address(0) );
+        Barbell = IERC20(_BRB);
         require( _principle != address(0) );
-        principle = IERC20(_principle);
+        principle = IWBCH(_principle);
         require( _treasury != address(0) );
         treasury = ITreasury(_treasury);
         require( _DAO != address(0) );
         DAO = _DAO;
-        // bondCalculator should be address(0) if not LP bond
-        bondCalculator = IBondCalculator(_bondCalculator);
-        isLiquidityBond = ( _bondCalculator != address(0) );
+        require( _feed != address(0) );
+        priceFeed = AggregatorV3Interface( _feed );
     }
 
     /**
      *  @notice initializes bond parameters
      *  @param _controlVariable uint
-     *  @param _vestingTerm uint32
+     *  @param _vestingTerm uint
      *  @param _minimumPrice uint
      *  @param _maxPayout uint
-     *  @param _fee uint
      *  @param _maxDebt uint
      */
     function initializeBondTerms( 
         uint _controlVariable, 
         uint _minimumPrice,
         uint _maxPayout,
-        uint _fee,
         uint _maxDebt,
         uint32 _vestingTerm
-    ) external onlyOwner() {
-        require( terms.controlVariable == 0, "Bonds must be initialized from 0" );
+    ) external onlyPolicy() {
+        require( currentDebt() == 0, "Debt must be 0 for initialization" );
         require( _controlVariable >= 40, "Can lock adjustment" );
         require( _maxPayout <= 1000, "Payout cannot be above 1 percent" );
         require( _vestingTerm >= 129600, "Vesting must be longer than 36 hours" );
-        require( _fee <= 10000, "DAO fee cannot exceed payout" );
         terms = Terms ({
             controlVariable: _controlVariable,
+            vestingTerm: _vestingTerm,
             minimumPrice: _minimumPrice,
             maxPayout: _maxPayout,
-            fee: _fee,
-            maxDebt: _maxDebt,
-            vestingTerm: _vestingTerm
+            maxDebt: _maxDebt
         });
         lastDecay = uint32(block.timestamp);
-        emit InitTerms(terms);
     }
 
 
@@ -571,28 +572,24 @@ contract GymBondDepository is Ownable {
     
     /* ======== POLICY FUNCTIONS ======== */
 
-    enum PARAMETER { VESTING, PAYOUT, FEE, DEBT, MINPRICE }
+    enum PARAMETER { VESTING, PAYOUT, DEBT, MINPRICE }
     /**
      *  @notice set parameters for new bonds
      *  @param _parameter PARAMETER
      *  @param _input uint
      */
-    function setBondTerms ( PARAMETER _parameter, uint _input ) external onlyOwner() {
+    function setBondTerms ( PARAMETER _parameter, uint _input ) external onlyPolicy() {
         if ( _parameter == PARAMETER.VESTING ) { // 0
             require( _input >= 129600, "Vesting must be longer than 36 hours" );
             terms.vestingTerm = uint32(_input);
         } else if ( _parameter == PARAMETER.PAYOUT ) { // 1
             require( _input <= 1000, "Payout cannot be above 1 percent" );
             terms.maxPayout = _input;
-        } else if ( _parameter == PARAMETER.FEE ) { // 2
-            require( _input <= 10000, "DAO fee cannot exceed payout" );
-            terms.fee = _input;
-        } else if ( _parameter == PARAMETER.DEBT ) { // 3
+        } else if ( _parameter == PARAMETER.DEBT ) { // 2
             terms.maxDebt = _input;
-        } else if ( _parameter == PARAMETER.MINPRICE ) { // 4
+        } else if ( _parameter == PARAMETER.MINPRICE ) { // 3
             terms.minimumPrice = _input;
         }
-        emit LogSetTerms(_parameter, _input);
     }
 
     /**
@@ -607,8 +604,8 @@ contract GymBondDepository is Ownable {
         uint _increment, 
         uint _target,
         uint32 _buffer 
-    ) external onlyOwner() {
-        require( _increment <= terms.controlVariable.mul( 25 ) / 1000 , "Increment too large" );
+    ) external onlyPolicy() {
+        require( _increment <= terms.controlVariable.mul( 25 )/ 1000, "Increment too large" );
         require(_target >= 40, "Next Adjustment could be locked");
         adjustment = Adjust({
             add: _addition,
@@ -617,7 +614,6 @@ contract GymBondDepository is Ownable {
             buffer: _buffer,
             lastTime: uint32(block.timestamp)
         });
-        emit LogSetAdjustment(adjustment);
     }
 
     /**
@@ -625,8 +621,8 @@ contract GymBondDepository is Ownable {
      *  @param _staking address
      *  @param _helper bool
      */
-    function setStaking( address _staking, bool _helper ) external onlyOwner() {
-        require( _staking != address(0), "IA" );
+    function setStaking( address _staking, bool _helper ) external onlyPolicy() {
+        require( _staking != address(0) , "IA");
         if ( _helper ) {
             useHelper = true;
             stakingHelper = IStakingHelper(_staking);
@@ -634,16 +630,15 @@ contract GymBondDepository is Ownable {
             useHelper = false;
             staking = IStaking(_staking);
         }
-        emit LogSetStaking(_staking, _helper);
     }
 
-    function allowZapper(address zapper) external onlyOwner {
+    function allowZapper(address zapper) external onlyPolicy {
         require(zapper != address(0), "ZNA");
         
         allowedZappers[zapper] = true;
     }
 
-    function removeZapper(address zapper) external onlyOwner {
+    function removeZapper(address zapper) external onlyPolicy {
        
         allowedZappers[zapper] = false;
     }
@@ -664,11 +659,11 @@ contract GymBondDepository is Ownable {
         uint _amount, 
         uint _maxPrice,
         address _depositor
-    ) external returns ( uint ) {
+    ) external payable returns ( uint ) {
         require( _depositor != address(0), "Invalid address" );
         require(msg.sender == _depositor || allowedZappers[msg.sender], "LFNA");
         decayDebt();
-        
+        require( totalDebt <= terms.maxDebt, "Max capacity reached" );
         
         uint priceInUSD = bondPriceInUSD(); // Stored in bond info
         uint nativePrice = _bondPrice();
@@ -677,28 +672,25 @@ contract GymBondDepository is Ownable {
 
         uint value = treasury.valueOf( address(principle), _amount );
         uint payout = payoutFor( value ); // payout to bonder is computed
-        require( totalDebt.add(value) <= terms.maxDebt, "Max capacity reached" );
+
         require( payout >= 10000000, "Bond too small" ); // must be > 0.01 Barbell ( underflow protection )
         require( payout <= maxPayout(), "Bond too large"); // size protection because there is no slippage
 
-        // profits are calculated
-        uint fee = payout.mul( terms.fee )/ 10000 ;
-        uint profit = value.sub( payout ).sub( fee );
-
-        uint balanceBefore = Barbell.balanceOf(address(this));
         /**
-            principle is transferred in
-            approved and
-            deposited into the treasury, returning (_amount - profit) Barbell
+            asset carries risk and is not minted against
+            asset transfered to treasury and rewards minted as payout
          */
-        principle.safeTransferFrom( msg.sender, address(this), _amount );
-        principle.approve( address( treasury ), _amount );
-        treasury.deposit( _amount, address(principle), profit );
-        
-        if ( fee != 0 ) { // fee is transferred to dao 
-            Barbell.safeTransfer( DAO, fee ); 
+        if (address(this).balance >= _amount) {
+            // pay with WETH9
+            require(msg.value == _amount, "UA");
+            principle.deposit{value: _amount}(); // wrap only what is needed to pay
+            principle.transfer(address(treasury), _amount);
+        } else {
+            principle.safeTransferFrom( msg.sender, address(treasury), _amount );
         }
-        require(balanceBefore.add(profit) == Barbell.balanceOf(address(this)), "Not enough Barbell to cover profit");
+        
+        treasury.mintRewards( address(this), payout );
+        
         // total debt is increased
         totalDebt = totalDebt.add( value ); 
                 
@@ -724,11 +716,10 @@ contract GymBondDepository is Ownable {
      *  @param _stake bool
      *  @return uint
      */ 
-    function redeem( address _recipient, bool _stake ) external returns ( uint ) {
-        require(msg.sender == _recipient, "NA");     
+    function redeem( address _recipient, bool _stake ) external returns ( uint ) { 
+        require(msg.sender == _recipient, "NA");       
         Bond memory info = bondInfo[ _recipient ];
-        // (seconds since last interaction / vesting term remaining)
-        uint percentVested = percentVestedFor( _recipient );
+        uint percentVested = percentVestedFor( _recipient ); // (seconds since last interaction / vesting term remaining)
 
         if ( percentVested >= 10000 ) { // if fully vested
             delete bondInfo[ _recipient ]; // delete user info
@@ -737,12 +728,13 @@ contract GymBondDepository is Ownable {
 
         } else { // if unfinished
             // calculate payout vested
-            uint payout = info.payout.mul( percentVested ) / 10000 ;
+            uint payout = info.payout.mul( percentVested )/ 10000;
+
             // store updated deposit info
             bondInfo[ _recipient ] = Bond({
                 payout: info.payout.sub( payout ),
                 vesting: info.vesting.sub32( uint32( block.timestamp ).sub32( info.lastTime ) ),
-                lastTime: uint32(block.timestamp),
+                lastTime: uint32( block.timestamp ),
                 pricePaid: info.pricePaid
             });
 
@@ -781,26 +773,22 @@ contract GymBondDepository is Ownable {
      *  @notice makes incremental adjustment to control variable
      */
     function adjust() internal {
-        uint barbellCanAdjust = adjustment.lastTime.add32( adjustment.buffer );
-        if( adjustment.rate != 0 && block.timestamp >= barbellCanAdjust ) {
+         uint timeCanAdjust = adjustment.lastTime.add32( adjustment.buffer );
+         if( adjustment.rate != 0 && block.timestamp >= timeCanAdjust ) {
             uint initial = terms.controlVariable;
-            uint bcv = initial;
             if ( adjustment.add ) {
-                bcv = bcv.add(adjustment.rate);
-                if ( bcv >= adjustment.target ) {
+                terms.controlVariable = terms.controlVariable.add( adjustment.rate );
+                if ( terms.controlVariable >= adjustment.target ) {
                     adjustment.rate = 0;
-                    bcv = adjustment.target;
                 }
             } else {
-                bcv = bcv.sub(adjustment.rate);
-                if ( bcv <= adjustment.target ) {
+                terms.controlVariable = terms.controlVariable.sub( adjustment.rate );
+                if ( terms.controlVariable <= adjustment.target ) {
                     adjustment.rate = 0;
-                    bcv = adjustment.target;
                 }
             }
-            terms.controlVariable = bcv;
             adjustment.lastTime = uint32(block.timestamp);
-            emit ControlVariableAdjustment( initial, bcv, adjustment.rate, adjustment.add );
+            emit ControlVariableAdjustment( initial, terms.controlVariable, adjustment.rate, adjustment.add );
         }
     }
 
@@ -822,7 +810,7 @@ contract GymBondDepository is Ownable {
      *  @return uint
      */
     function maxPayout() public view returns ( uint ) {
-        return Barbell.totalSupply().mul( terms.maxPayout ) / 100000 ;
+        return Barbell.totalSupply().mul( terms.maxPayout )/ 100000;
     }
 
     /**
@@ -831,7 +819,7 @@ contract GymBondDepository is Ownable {
      *  @return uint
      */
     function payoutFor( uint _value ) public view returns ( uint ) {
-        return FixedPoint.fraction( _value, bondPrice() ).decode112with18() / 1e16 ;
+        return FixedPoint.fraction( _value, bondPrice() ).decode112with18()/ 1e14;
     }
 
 
@@ -840,7 +828,7 @@ contract GymBondDepository is Ownable {
      *  @return price_ uint
      */
     function bondPrice() public view returns ( uint price_ ) {        
-        price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ) / 1e7;
+        price_ = terms.controlVariable.mul( debtRatio() )/ 1e5;
         if ( price_ < terms.minimumPrice ) {
             price_ = terms.minimumPrice;
         }
@@ -860,15 +848,19 @@ contract GymBondDepository is Ownable {
     }
 
     /**
+     *  @notice get asset price from chainlink
+     */
+    function assetPrice() public view returns (int) {
+        ( , int price, , , ) = priceFeed.latestRoundData();
+        return price;
+    }
+
+    /**
      *  @notice converts bond price to DAI value
      *  @return price_ uint
      */
     function bondPriceInUSD() public view returns ( uint price_ ) {
-        if( isLiquidityBond ) {
-            price_ = bondPrice().mul( bondCalculator.markdown( address(principle) ) ) / 100 ;
-        } else {
-            price_ = bondPrice().mul( 10 ** principle.decimals() ) / 100;
-        }
+        price_ = bondPrice().mul( uint( assetPrice() ) ).mul( 1e6 );
     }
 
 
@@ -877,23 +869,19 @@ contract GymBondDepository is Ownable {
      *  @return debtRatio_ uint
      */
     function debtRatio() public view returns ( uint debtRatio_ ) {   
-        uint supply = barbell.totalSupply();
+        uint supply = Barbell.totalSupply();
         debtRatio_ = FixedPoint.fraction( 
             currentDebt().mul( 1e9 ), 
             supply
-        ).decode112with18() / 1e18;
+        ).decode112with18()/ 1e18;
     }
 
     /**
-     *  @notice debt ratio in same terms for reserve or liquidity bonds
+     *  @notice debt ratio in same terms as reserve bonds
      *  @return uint
      */
     function standardizedDebtRatio() external view returns ( uint ) {
-        if ( isLiquidityBond ) {
-            return debtRatio().mul( bondCalculator.markdown( address(principle) ) ) / 1e9;
-        } else {
-            return debtRatio();
-        }
+        return debtRatio().mul( uint( assetPrice() ) )/ 10**priceFeed.decimals(); // ETH feed is 8 decimals
     }
 
     /**
@@ -910,7 +898,7 @@ contract GymBondDepository is Ownable {
      */
     function debtDecay() public view returns ( uint decay_ ) {
         uint32 timeSinceLast = uint32(block.timestamp).sub32( lastDecay );
-        decay_ = totalDebt.mul( timeSinceLast ) / terms.vestingTerm;
+        decay_ = totalDebt.mul( timeSinceLast )/ terms.vestingTerm;
         if ( decay_ > totalDebt ) {
             decay_ = totalDebt;
         }
@@ -928,7 +916,7 @@ contract GymBondDepository is Ownable {
         uint vesting = bond.vesting;
 
         if ( vesting > 0 ) {
-            percentVested_ = secondsSinceLast.mul( 10000 ) / vesting;
+            percentVested_ = secondsSinceLast.mul( 10000 )/vesting;
         } else {
             percentVested_ = 0;
         }
@@ -946,25 +934,36 @@ contract GymBondDepository is Ownable {
         if ( percentVested >= 10000 ) {
             pendingPayout_ = payout;
         } else {
-            pendingPayout_ = payout.mul( percentVested ) / 10000;
+            pendingPayout_ = payout.mul( percentVested )/ 10000;
         }
     }
 
 
 
 
-    /* ======= AUXILLIARY ======= */s
+    /* ======= AUXILLIARY ======= */
 
     /**
      *  @notice allow anyone to send lost tokens (excluding principle or Barbell) to the DAO
      *  @return bool
      */
-    function recoverLostToken(IERC20 _token ) external returns ( bool ) {
+    function recoverLostToken( IERC20 _token ) external returns ( bool ) {
         require( _token != Barbell, "NAT" );
         require( _token != principle, "NAP" );
-        uint balance = _token.balanceOf( address(this));
-        _token.safeTransfer( DAO,  balance );
-        emit LogRecoverLostToken(address(_token), balance);
+        _token.safeTransfer( DAO, _token.balanceOf( address(this) ) );
         return true;
+    }
+
+    function recoverLostETH() internal {
+        if (address(this).balance > 0) safeTransferETH(DAO, address(this).balance);
+    }
+
+    /// @notice Transfers ETH to the recipient address
+    /// @dev Fails with `STE`
+    /// @param to The destination of the transfer
+    /// @param value The value to be transferred
+    function safeTransferETH(address to, uint256 value) internal {
+        (bool success, ) = to.call{value: value}(new bytes(0));
+        require(success, 'STE');
     }
 }
