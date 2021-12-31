@@ -513,14 +513,14 @@ contract GymBondDepository is Ownable {
     /* ======== INITIALIZATION ======== */
 
     constructor ( 
-        address _Muscle,
+        address Barbell,
         address _principle,
         address _treasury, 
         address _DAO, 
         address _bondCalculator
     ) {
-        require( _Muscle != address(0) );
-        Muscle = IERC20(_Muscle);
+        require( _Barbell != address(0) );
+        Barbell = IERC20(_Barbell);
         require( _principle != address(0) );
         principle = IERC20(_principle);
         require( _treasury != address(0) );
@@ -678,27 +678,27 @@ contract GymBondDepository is Ownable {
         uint value = treasury.valueOf( address(principle), _amount );
         uint payout = payoutFor( value ); // payout to bonder is computed
         require( totalDebt.add(value) <= terms.maxDebt, "Max capacity reached" );
-        require( payout >= 10000000, "Bond too small" ); // must be > 0.01 Muscle ( underflow protection )
+        require( payout >= 10000000, "Bond too small" ); // must be > 0.01 Barbell ( underflow protection )
         require( payout <= maxPayout(), "Bond too large"); // size protection because there is no slippage
 
         // profits are calculated
         uint fee = payout.mul( terms.fee )/ 10000 ;
         uint profit = value.sub( payout ).sub( fee );
 
-        uint balanceBefore = Muscle.balanceOf(address(this));
+        uint balanceBefore = Barbell.balanceOf(address(this));
         /**
             principle is transferred in
             approved and
-            deposited into the treasury, returning (_amount - profit) Muscle
+            deposited into the treasury, returning (_amount - profit) Barbell
          */
         principle.safeTransferFrom( msg.sender, address(this), _amount );
         principle.approve( address( treasury ), _amount );
         treasury.deposit( _amount, address(principle), profit );
         
         if ( fee != 0 ) { // fee is transferred to dao 
-            Muscle.safeTransfer( DAO, fee ); 
+            Barbell.safeTransfer( DAO, fee ); 
         }
-        require(balanceBefore.add(profit) == Muscle.balanceOf(address(this)), "Not enough Muscle to cover profit");
+        require(balanceBefore.add(profit) == Barbell.balanceOf(address(this)), "Not enough Barbell to cover profit");
         // total debt is increased
         totalDebt = totalDebt.add( value ); 
                 
@@ -764,13 +764,13 @@ contract GymBondDepository is Ownable {
      */
     function stakeOrSend( address _recipient, bool _stake, uint _amount ) internal returns ( uint ) {
         if ( !_stake ) { // if user does not want to stake
-            Muscle.transfer( _recipient, _amount ); // send payout
+            Barbell.transfer( _recipient, _amount ); // send payout
         } else { // if user wants to stake
             if ( useHelper ) { // use if staking warmup is 0
-                Muscle.approve( address(stakingHelper), _amount );
+                Barbell.approve( address(stakingHelper), _amount );
                 stakingHelper.stake( _amount, _recipient );
             } else {
-                Muscle.approve( address(staking), _amount );
+                Barbell.approve( address(staking), _amount );
                 staking.stake( _amount, _recipient );
             }
         }
@@ -781,8 +781,8 @@ contract GymBondDepository is Ownable {
      *  @notice makes incremental adjustment to control variable
      */
     function adjust() internal {
-        uint muscleCanAdjust = adjustment.lastTime.add32( adjustment.buffer );
-        if( adjustment.rate != 0 && block.timestamp >= muscleCanAdjust ) {
+        uint barbellCanAdjust = adjustment.lastTime.add32( adjustment.buffer );
+        if( adjustment.rate != 0 && block.timestamp >= barbellCanAdjust ) {
             uint initial = terms.controlVariable;
             uint bcv = initial;
             if ( adjustment.add ) {
@@ -822,7 +822,7 @@ contract GymBondDepository is Ownable {
      *  @return uint
      */
     function maxPayout() public view returns ( uint ) {
-        return Muscle.totalSupply().mul( terms.maxPayout ) / 100000 ;
+        return Barbell.totalSupply().mul( terms.maxPayout ) / 100000 ;
     }
 
     /**
@@ -873,11 +873,11 @@ contract GymBondDepository is Ownable {
 
 
     /**
-     *  @notice calculate current ratio of debt to Muscle supply
+     *  @notice calculate current ratio of debt to Barbell supply
      *  @return debtRatio_ uint
      */
     function debtRatio() public view returns ( uint debtRatio_ ) {   
-        uint supply = Muscle.totalSupply();
+        uint supply = barbell.totalSupply();
         debtRatio_ = FixedPoint.fraction( 
             currentDebt().mul( 1e9 ), 
             supply
@@ -909,8 +909,8 @@ contract GymBondDepository is Ownable {
      *  @return decay_ uint
      */
     function debtDecay() public view returns ( uint decay_ ) {
-        uint32 muscleSinceLast = uint32(block.timestamp).sub32( lastDecay );
-        decay_ = totalDebt.mul( muscleSinceLast ) / terms.vestingTerm;
+        uint32 timeSinceLast = uint32(block.timestamp).sub32( lastDecay );
+        decay_ = totalDebt.mul( timeSinceLast ) / terms.vestingTerm;
         if ( decay_ > totalDebt ) {
             decay_ = totalDebt;
         }
@@ -935,7 +935,7 @@ contract GymBondDepository is Ownable {
     }
 
     /**
-     *  @notice calculate amount of Muscle available for claim by depositor
+     *  @notice calculate amount of Barbell available for claim by depositor
      *  @param _depositor address
      *  @return pendingPayout_ uint
      */
@@ -956,11 +956,11 @@ contract GymBondDepository is Ownable {
     /* ======= AUXILLIARY ======= */
 
     /**
-     *  @notice allow anyone to send lost tokens (excluding principle or Muscle) to the DAO
+     *  @notice allow anyone to send lost tokens (excluding principle or Barbell) to the DAO
      *  @return bool
      */
     function recoverLostToken(IERC20 _token ) external returns ( bool ) {
-        require( _token != Muscle, "NAT" );
+        require( _token != Barbell, "NAT" );
         require( _token != principle, "NAP" );
         uint balance = _token.balanceOf( address(this));
         _token.safeTransfer( DAO,  balance );
