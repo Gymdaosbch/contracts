@@ -84,18 +84,18 @@ contract StakingHelper {
     event LogStake(address indexed recipient, uint amount);
 
     IStaking public immutable staking;
-    IERC20 public immutable Barbell;
+    IERC20 public immutable Time;
 
-    constructor ( address _staking, address _Barbell ) {
+    constructor ( address _staking, address _Time ) {
         require( _staking != address(0) );
         staking = IStaking(_staking);
-        require( Barbell != address(0) );
-        Barbell = IERC20(Barbell);
+        require( _Time != address(0) );
+        Time = IERC20(_Time);
     }
 
     function stake( uint _amount, address recipient ) external {
-        Barbell.transferFrom( msg.sender, address(this), _amount );
-        Barbell.approve( address(staking), _amount );
+        Time.transferFrom( msg.sender, address(this), _amount );
+        Time.approve( address(staking), _amount );
         staking.stake( _amount, recipient );
         staking.claim( recipient );
         emit LogStake(recipient, _amount);
